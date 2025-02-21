@@ -1,10 +1,27 @@
 """Notion tools using Pydantic-AI and dynamic models."""
-from typing import Dict, List, Optional, Type, Any
+from typing import Dict, List, Optional, Type, Any, Union
+from datetime import datetime
+import logging
 from pydantic import BaseModel
 from pydantic_ai.tools import Tool
+import logfire
 from notion_client import Client
 from notion_schema import NotionSchemaGenerator
-from config import NOTION_SECRET
+from notion_models import (
+    DatabaseListItem, DatabaseSchema, PeopleFilter,
+    QueryFilter, DatabaseQuery, PageProperties, PageResponse
+)
+from config import NOTION_SECRET, LOGFIRE_TOKEN
+
+# Configure Logfire
+logfire.configure()
+
+# Also set up standard logging for console output
+console_logger = logging.getLogger(__name__)
+console_logger.setLevel(logging.DEBUG)
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+console_logger.addHandler(console_handler)
 
 class NotionTools:
     def __init__(self):
@@ -16,38 +33,8 @@ class NotionTools:
 
     def _initialize_tools(self):
         """Initialize the basic tools."""
-        self.tools = [
-            Tool(
-                name="list_databases",
-                function=self.list_databases,
-                description="List all available Notion databases"
-            ),
-            Tool(
-                name="get_database_schema",
-                function=self.get_database_schema,
-                description="Get the schema for a specific database"
-            ),
-            Tool(
-                name="query_database",
-                function=self.query_database,
-                description="Query items from a database with optional filters"
-            ),
-            Tool(
-                name="create_page",
-                function=self.create_page,
-                description="Create a new page in a database"
-            ),
-            Tool(
-                name="update_page",
-                function=self.update_page,
-                description="Update an existing page in a database"
-            ),
-            Tool(
-                name="delete_page",
-                function=self.delete_page,
-                description="Archive/delete a page from a database"
-            )
-        ]
+        # Tools are now registered using decorators on the agent
+        pass
 
     def _get_or_create_model(self, database_id: str) -> Type[BaseModel]:
         """Get an existing model or create a new one for a database."""
@@ -55,53 +42,196 @@ class NotionTools:
             self.database_models[database_id] = self.schema_generator.generate_database_model(database_id)
         return self.database_models[database_id]
 
-    async def list_databases(self) -> List[Dict[str, str]]:
+    async def list_databases(self) -> List[DatabaseListItem]:
         """List all databases the integration has access to."""
         response = self.client.search(filter={"property": "object", "value": "database"})
-        return [{
-            'id': db['id'],
-            'title': db['title'][0]['text']['content'] if db['title'] else 'Untitled',
-            'created_time': db['created_time'],
-            'last_edited_time': db['last_edited_time']
-        } for db in response['results']]
+        return [
+            DatabaseListItem(
+                id=db['id'],
+                title=db['title'][0]['text']['content'] if db['title'] else 'Untitled',
+                created_time=datetime.fromisoformat(db['created_time'].replace('Z', '+00:00')),
+                last_edited_time=datetime.fromisoformat(db['last_edited_time'].replace('Z', '+00:00'))
+            )
+            for db in response['results']
+        ]
 
-    async def get_database_schema(self, database_id: str) -> Dict[str, Any]:
+    async def get_database_schema(self, database_id: str) -> DatabaseSchema:
         """Get the schema for a specific database."""
         model = self._get_or_create_model(database_id)
-        return model.model_json_schema()
+        schema = model.model_json_schema()
+        return DatabaseSchema(
+            title=schema.get('title', ''),
+            properties=schema.get('properties', {})
+        )
+
+    async def _find_user_id(self, name: str) -> Optional[str]:
+        """Find a user's ID by their name."""
+        try:
+            users = self.client.users.list()["results"]
+            for user in users:
+                if name.lower() in user["name"].lower():
+                    return user["id"]
+            return None
+        except Exception as e:
+            print(f"Error finding user: {e}")
+            return None
 
     async def query_database(
         self,
         database_id: str,
-        filter_by: Optional[Dict[str, Any]] = None,
+        filter_by: Optional[Union[Dict[str, Any], QueryFilter]] = None,
         sort_by: Optional[List[Dict[str, Any]]] = None,
         page_size: int = 100
     ) -> List[Dict[str, Any]]:
         """Query items from a database with optional filters."""
+        logger.debug(f"Querying database {database_id} with filter: {filter_by}")
+        
         model = self._get_or_create_model(database_id)
+        logger.debug(f"Using model: {model.__name__}")
         
         query_params = {
             "database_id": database_id,
             "page_size": page_size
         }
-        if filter_by:
-            query_params["filter"] = filter_by
+        
+        # Handle filter conditions
+        if isinstance(filter_by, QueryFilter):
+            logfire.debug(
+                "Processing QueryFilter",
+                filter=filter_by.model_dump(),
+                component="NotionTools",
+                action="process_query_filter"
+            )
+            if filter_by.filter_type == 'person':
+                user_id = await self._find_user_id(filter_by.value)
+                logfire.debug(
+                    "Found user ID",
+                    user_id=user_id,
+                    name=filter_by.value,
+                    component="NotionTools",
+                    action="find_user_id"
+                )
+                if user_id:
+                    query_params["filter"] = {
+                        "property": filter_by.property_name or "Assignee",
+                        "people": {
+                            "contains": user_id
+                        }
+                    }
+                else:
+                    raise ValueError(f"Could not find user with name '{filter_by.value}'")
+            elif filter_by.filter_type == 'text':
+                query_params["filter"] = {
+                    "property": filter_by.property_name,
+                    "rich_text": {
+                        "contains": filter_by.value
+                    }
+                }
+            elif filter_by.filter_type == 'select':
+                query_params["filter"] = {
+                    "property": filter_by.property_name,
+                    "select": {
+                        "equals": filter_by.value
+                    }
+                }
+            elif filter_by.filter_type == 'status':
+                query_params["filter"] = {
+                    "property": filter_by.property_name,
+                    "status": {
+                        "equals": filter_by.value
+                    }
+                }
+            else:
+                # For other filter types, pass through as is
+                query_params["filter"] = {
+                    "property": filter_by.property_name,
+                    filter_by.filter_type: filter_by.value
+                }
+        elif isinstance(filter_by, dict):
+            logfire.debug(
+                "Processing dict filter",
+                filter=filter_by,
+                component="NotionTools",
+                action="process_dict_filter"
+            )
+            # Handle natural language filter
+            if 'text' in filter_by and filter_by['text'] == 'person':
+                user_id = await self._find_user_id(filter_by['value'])
+                logfire.debug(
+                    "Found user ID",
+                    user_id=user_id,
+                    name=filter_by['value'],
+                    component="NotionTools",
+                    action="find_user_id"
+                )
+                if user_id:
+                    query_params["filter"] = {
+                        "property": filter_by.get('property', 'Assignee'),
+                        "people": {
+                            "contains": user_id
+                        }
+                    }
+                else:
+                    raise ValueError(f"Could not find user with name '{filter_by['value']}'")
+            else:
+                query_params["filter"] = filter_by
+        
+        logfire.debug(
+            "Query parameters prepared",
+            query_params=query_params,
+            component="NotionTools",
+            action="prepare_query_params"
+        )
+        
         if sort_by:
             query_params["sorts"] = sort_by
 
+        logfire.debug(
+            "Executing Notion API query",
+            component="NotionTools",
+            action="execute_query"
+        )
         response = self.client.databases.query(**query_params)
+        logfire.debug(
+            "Query results received",
+            result_count=len(response['results']),
+            component="NotionTools",
+            action="process_results"
+        )
         
         # Convert results to our model format
-        return [
-            model.from_notion_page(page).model_dump()
-            for page in response['results']
-        ]
+        results = []
+        for page in response['results']:
+            try:
+                model_instance = model.from_notion_page(page)
+                logfire.debug(
+                    "Page converted to model",
+                    page_id=page['id'],
+                    model_type=model.__name__,
+                    component="NotionTools",
+                    action="convert_page"
+                )
+                results.append(model_instance.model_dump())
+            except Exception as e:
+                logfire.error(
+                    "Error converting page",
+                    page_id=page['id'],
+                    error=str(e),
+                    error_type=type(e).__name__,
+                    page_data=page,
+                    component="NotionTools",
+                    action="convert_page_error",
+                    exc_info=True
+                )
+                raise
+        
+        return results
 
     async def create_page(
         self,
         database_id: str,
         properties: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> PageResponse:
         """Create a new page in a database."""
         model = self._get_or_create_model(database_id)
         
@@ -117,14 +247,19 @@ class NotionTools:
             properties=notion_properties
         )
         
-        # Return the created page in our model format
-        return model.from_notion_page(response).model_dump()
+        # Return the created page
+        return PageResponse(
+            id=response['id'],
+            properties=response['properties'],
+            created_time=datetime.fromisoformat(response['created_time'].replace('Z', '+00:00')),
+            last_edited_time=datetime.fromisoformat(response['last_edited_time'].replace('Z', '+00:00'))
+        )
 
     async def update_page(
         self,
         page_id: str,
         properties: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    ) -> PageResponse:
         """Update an existing page."""
         # Get the database_id from the page
         page = self.client.pages.retrieve(page_id=page_id)
@@ -149,16 +284,26 @@ class NotionTools:
             properties=notion_properties
         )
         
-        # Return the updated page in our model format
-        return model.from_notion_page(response).model_dump()
+        # Return the updated page
+        return PageResponse(
+            id=response['id'],
+            properties=response['properties'],
+            created_time=datetime.fromisoformat(response['created_time'].replace('Z', '+00:00')),
+            last_edited_time=datetime.fromisoformat(response['last_edited_time'].replace('Z', '+00:00'))
+        )
 
-    async def delete_page(self, page_id: str) -> Dict[str, str]:
+    async def delete_page(self, page_id: str) -> PageResponse:
         """Archive/delete a page."""
-        self.client.pages.update(
+        response = self.client.pages.update(
             page_id=page_id,
             archived=True
         )
-        return {"status": "success", "message": f"Page {page_id} has been archived"}
+        return PageResponse(
+            id=response['id'],
+            properties=response['properties'],
+            created_time=datetime.fromisoformat(response['created_time'].replace('Z', '+00:00')),
+            last_edited_time=datetime.fromisoformat(response['last_edited_time'].replace('Z', '+00:00'))
+        )
 
 # Example usage:
 if __name__ == "__main__":

@@ -8,4 +8,6 @@ dependencies = [
     "python-dotenv>=1.0.1",
     "notion-client>=2.3.0",
     "pydantic-ai>=0.0.24",
+    "rich>=13.9.4",
+    "logfire>=3.6.1",
 ]
