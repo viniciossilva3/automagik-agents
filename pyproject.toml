@@ -7,4 +7,5 @@ requires-python = ">=3.10"
 dependencies = [
     "python-dotenv>=1.0.1",
     "notion-client>=2.3.0",
+    "pydantic-ai>=0.0.24",
 ]
