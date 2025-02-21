@@ -13,10 +13,7 @@ from notion_models import (
 )
 from config import NOTION_SECRET, LOGFIRE_TOKEN
 
-# Configure Logfire
-logfire.configure()
-
-# Also set up standard logging for console output
+# Set up standard logging for console output
 console_logger = logging.getLogger(__name__)
 console_logger.setLevel(logging.DEBUG)
 console_handler = logging.StreamHandler()
@@ -45,15 +42,20 @@ class NotionTools:
     async def list_databases(self) -> List[DatabaseListItem]:
         """List all databases the integration has access to."""
         response = self.client.search(filter={"property": "object", "value": "database"})
-        return [
-            DatabaseListItem(
+        databases = []
+        for db in response['results']:
+            title = ''
+            if db.get('title'):
+                for text_block in db['title']:
+                    if text_block.get('text', {}).get('content'):
+                        title += text_block['text']['content']
+            databases.append(DatabaseListItem(
                 id=db['id'],
-                title=db['title'][0]['text']['content'] if db['title'] else 'Untitled',
+                title=title or 'Untitled',
                 created_time=datetime.fromisoformat(db['created_time'].replace('Z', '+00:00')),
                 last_edited_time=datetime.fromisoformat(db['last_edited_time'].replace('Z', '+00:00'))
-            )
-            for db in response['results']
-        ]
+            ))
+        return databases
 
     async def get_database_schema(self, database_id: str) -> DatabaseSchema:
         """Get the schema for a specific database."""
@@ -84,10 +86,21 @@ class NotionTools:
         page_size: int = 100
     ) -> List[Dict[str, Any]]:
         """Query items from a database with optional filters."""
-        logger.debug(f"Querying database {database_id} with filter: {filter_by}")
+        logfire.debug(
+            "Querying database",
+            database_id=database_id,
+            filter=filter_by,
+            component="NotionTools",
+            action="query_database"
+        )
         
         model = self._get_or_create_model(database_id)
-        logger.debug(f"Using model: {model.__name__}")
+        logfire.debug(
+            "Using model",
+            model=model.__name__,
+            component="NotionTools",
+            action="query_database"
+        )
         
         query_params = {
             "database_id": database_id,

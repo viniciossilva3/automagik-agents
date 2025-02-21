@@ -15,7 +15,7 @@ class NotionSchemaGenerator:
             'select': str,
             'multi_select': List[str],
             'date': datetime,
-            'people': List[str],
+            'people': List[Dict[str, Any]],  # People are complex objects with id, name, etc.
             'files': List[str],
             'checkbox': bool,
             'url': str,

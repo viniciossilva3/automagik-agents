@@ -3,8 +3,11 @@ import asyncio
 from typing import List, Dict, Any, Optional
 import json
 import logging
+from datetime import datetime, timezone
+from agent_models import AgentResponse
 from dataclasses import dataclass
 from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 import logfire
 from notion_tools import NotionTools
 from notion_models import (
@@ -16,6 +19,7 @@ from rich.markdown import Markdown
 from rich.prompt import Prompt
 from rich import print as rprint
 from config import OPENAI_API_KEY, LOGFIRE_TOKEN
+from memory import memory
 import os
 
 # Configure Logfire
@@ -39,6 +43,20 @@ class NotionDeps:
 notion_agent = Agent(
     'openai:gpt-4o-mini',
     system_prompt="""You are Sofia, a friendly AI assistant who helps manage Notion databases. You have a warm, conversational style and genuinely enjoy helping users organize their work.
+
+You will receive a conversation history in the format:
+[
+    {"role": "user", "content": "user message"},
+    {"role": "ai", "content": "your response"}
+]
+
+Use this history to maintain context and remember important information like the user's name.
+
+You must ALWAYS return responses in the following JSON format:
+{
+    "reasoning": "Your internal thought process about how to handle the request (optional)",
+    "message": "The actual response message to show to the user (required)"
+}
     
     Your personality:
     - Friendly and approachable - use casual language and emojis occasionally
@@ -144,22 +162,19 @@ class NotionAgent:
         """Handle a user command."""
         logfire.debug("Command received", command=command, component="NotionAgent", action="handle_command")
         
-        # Refresh database cache if needed
-        if not self._databases:
-            logfire.debug("Refreshing database cache", component="NotionAgent", action="refresh_cache")
-            await self.refresh_database_cache()
+        # Add message to memory and get conversation history
+        memory.add_message('user', command)
+        conversation = memory.get_messages()
+        logfire.debug("Added user message to memory", command=command, conversation=conversation)
         
-        # Add context about available databases to the message
-        db_context = "\nAvailable databases:\n" + "\n".join(
-            f"- {name} (ID: {db['id']})" 
-            for name, db in self._databases.items()
-        )
+        cmd_lower = command.lower()
+
+        # Prepare message
+        message = command
         
-        message = command + db_context
         logfire.debug(
             "Prepared message for agent", 
             message=message,
-            databases=list(self._databases.keys()),
             component="NotionAgent",
             action="prepare_message"
         )
@@ -168,20 +183,48 @@ class NotionAgent:
             # Create dependencies
             deps = NotionDeps(notion_tools=self.notion_tools)
             
-            # Get response from agent
-            logfire.debug("Calling agent", component="NotionAgent", action="run_agent")
-            result = await notion_agent.run(message, deps=deps)
+            # Get conversation history and convert to ModelMessages
+            history = []
+            for msg in memory.get_messages():
+                timestamp = datetime.now(tz=timezone.utc)
+                if msg['role'] == 'user':
+                    history.append(ModelRequest(parts=[UserPromptPart(content=msg['content'], timestamp=timestamp)]))
+                else:
+                    history.append(ModelResponse(parts=[TextPart(msg['content'])], timestamp=timestamp))
             
-            # Format and display the response
-            response = result.data if hasattr(result, 'data') else str(result)
+            # Get response from agent
+            logfire.debug("Calling agent", component="NotionAgent", action="run_agent", conversation=history)
+            result = await notion_agent.run(message, deps=deps, message_history=history)
+            
+            # Extract response data
+            response_data = result.data if hasattr(result, 'data') else str(result)
+            
+            # Try to parse as JSON if it's a string
+            if isinstance(response_data, str):
+                try:
+                    import json
+                    response_data = json.loads(response_data)
+                except json.JSONDecodeError:
+                    # If not JSON, wrap in message field
+                    response_data = {"message": response_data}
+            
+            # Parse and validate response
+            response = AgentResponse.model_validate(response_data)
             logfire.debug(
                 "Agent response received",
-                response_type=type(result).__name__,
-                has_data=hasattr(result, 'data'),
+                response_type=type(response).__name__,
+                has_reasoning=bool(response.reasoning),
                 component="NotionAgent",
                 action="process_response"
             )
-            self.console.print(Markdown(response))
+            
+            # Store AI response in memory
+            memory.add_message('ai', response.message)
+            
+            # Display the response
+            if response.reasoning:
+                logfire.debug("Agent reasoning", reasoning=response.reasoning)
+            self.console.print(Markdown(response.message))
         except Exception as e:
             logfire.error(
                 "Error handling command",
